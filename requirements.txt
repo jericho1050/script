@@ -1,0 +1,6 @@
+openpyxl
+pandas
+apify-client
+pytest
+requests 
+python-dotenv
