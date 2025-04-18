@@ -1,6 +1,7 @@
-openpyxl
+requests
 pandas
-apify-client
-pytest
-requests 
+openpyxl
 python-dotenv
+serpapi
+thefuzz[speedup] # Added for fuzzy matching (includes python-Levenshtein)
+google-generativeai # For LLM verification
