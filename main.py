@@ -7,35 +7,10 @@ from dotenv import load_dotenv
 import requests
 import re
 import time
+import json
 from typing import Optional, Dict, Any, List
-from serpapi.google_search import GoogleSearch # Adjusted import for SerpAPI
-from thefuzz import fuzz # Added for fuzzy matching
-import google.generativeai as genai # Added for LLM verification
 
 load_dotenv()
-
-# Configure Gemini API
-gemini_api_key = os.getenv("GOOGLE_API_KEY")
-gemini_model = "gemini-2.5-flash-preview-04-17"
-if not gemini_api_key:
-    print("Warning: GOOGLE_API_KEY environment variable not set. Gemini verification will be skipped.")
-else:
-    try:
-        genai.configure(api_key=gemini_api_key)
-        gemini_model = genai.GenerativeModel('gemini-2.5-flash-preview-04-17')
-        print("Gemini Flash model configured successfully.")
-    except Exception as e:
-        print(f"Error configuring Gemini: {e}. Gemini verification will be skipped.")
-
-# Constants for matching thresholds
-MIN_NAME_SCORE = 85
-MIN_COMPANY_SCORE = 70
-MIN_COMBINED_SCORE = 80
-MIN_DOMAIN_SCORE = 60
-HIGH_NAME_SCORE = 95
-LOWER_COMPANY_SCORE = 60
-GEMINI_THRESHOLD_LOW = 80
-GEMINI_THRESHOLD_HIGH = 95
 
 # the xlsx file to fill
 XLSX_FILE = 'KNM_LIST.xlsx'
@@ -62,172 +37,327 @@ class Lead411Enricher:
         self.email: str = email
         self.password: str = password
         self._token: Optional[str] = None
+        self._authenticate() # Authenticate on initialization
 
-    def _get_token(self) -> Optional[str]:
-        """
-        Authenticates with Lead411 API to get/refresh the access token.
-        Returns the token string or None if authentication fails.
-        """
-        # Only check if token exists
-        if self._token:
-            return self._token
-
+    def _authenticate(self) -> None:
+        """Authenticates with Lead411 API to get the access token."""
         print("   Authenticating with Lead411...")
         auth_url = f"{self.BASE_URL}/authenticate_user"
-        payload = {"email": self.email, "password": self.password}
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        # Lead411 auth uses query parameters, not JSON body
+        params = {"email": self.email, "password": self.password}
+        headers = {"Accept": "application/json"} # Keep Accept header
         try:
-            response = requests.post(auth_url, json=payload, headers=headers, timeout=15)
+            # Use POST method as per documentation
+            response = requests.post(auth_url, params=params, headers=headers, timeout=15)
             response.raise_for_status()
             data = response.json()
-            
-            if data.get("success") and data.get("token"):
+
+            if data.get("status") == "success" and data.get("token"):
                 self._token = data["token"]
                 print("   Lead411 Authentication successful.")
-                return self._token
             else:
-                error_message = data.get('message', 'Unknown error')
+                error_message = data.get('message', 'Unknown authentication error')
                 print(f"   Lead411 Authentication failed: {error_message}")
                 self._token = None
-                return None
+                # Optionally raise an error if authentication is critical
+                # raise ConnectionError(f"Lead411 Authentication failed: {error_message}")
         except requests.exceptions.Timeout:
             print("   Lead411 Authentication request timed out.")
             self._token = None
-            return None
+            # raise ConnectionError("Lead411 Authentication request timed out.")
         except requests.exceptions.RequestException as e:
             error_details = ""
             try:
-                error_details = response.text
+                # Try to get more details from the response if available
+                error_details = f" Status Code: {response.status_code}, Response: {response.text}"
             except:
                 pass
-            print(f"   Lead411 Authentication request error: {e} - Response: {error_details}")
+            print(f"   Lead411 Authentication request error: {e}{error_details}")
             self._token = None
-            return None
+            # raise ConnectionError(f"Lead411 Authentication request error: {e}{error_details}")
 
-    def _search_contact(self, first_name: str, last_name: str, 
-                       company_name: Optional[str], company_website: Optional[str]) -> Optional[int]:
+    def _get_token(self) -> Optional[str]:
+        """Returns the current token, re-authenticating if necessary (though currently auth is in __init__)."""
+        # Simple getter for now, assumes __init__ handled auth
+        # Could add token expiry check and re-auth logic here if needed later
+        if not self._token:
+            print("   Warning: Lead411 token not available. Authentication might have failed.")
+        return self._token
+
+    def _search_contact(self, first_name: str, last_name: str, title: Optional[str],
+                       company_name: Optional[str], company_website: Optional[str],
+                       state: Optional[str] = None) -> Optional[int]:
         """
         Searches for a contact using Lead411 API.
-        Returns the employee_id if an exact match is found, otherwise None.
+        Returns the employee_id if a suitable match is found, otherwise None.
+        Uses the company-specific employee search endpoint.
         """
         token = self._get_token()
         if not token:
             print("   Skipping search: Authentication token not available.")
             return None
 
-        search_url = f"{self.BASE_URL}/search/searchUsingJSON"
-        # Token goes in params, not headers for this endpoint
-        headers = {"Content-Type": "application/json"} 
-        params = {"token": token}
-        
-        # Use company website or name as the search string
-        search_query = company_website or company_name
-        if not search_query:
-            print("   Skipping search: Missing company website or name.")
+        # First, search for the company to get its ID
+        company_id = self._get_company_id(company_name, company_website, token)
+        if not company_id:
+            print("   Could not find company ID.")
             return None
 
-        search_criteria = {
-            "first_name": first_name,
-            "last_name": last_name,
-            "user_search_string": search_query, 
-            "page_number": 1,
-            "records_per_page": 5  # Limit results to find the best match quickly
-        }
+        # Now search for employees within that company
+        search_url = f"{self.BASE_URL}/company/searchCompanyEmployees"
+        headers = {"Accept": "application/json"}
         
-        print(f"   Searching Lead411 for {first_name} {last_name} at {search_query}...")
+        # Use both first and last name for better matching
+        search_name = f"{first_name} {last_name}".strip()
+        
+        params = {
+            "token": token,
+            "company_id": company_id,
+            "search_name": search_name
+        }
+
+        print(f"   Searching Lead411 for {search_name} at company ID {company_id}...")
         try:
-            # Pass token in params, search criteria in json body
-            response = requests.post(search_url, params=params, json=search_criteria, headers=headers, timeout=20)
+            response = requests.post(search_url, params=params, headers=headers, timeout=20)
             response.raise_for_status()
             data = response.json()
 
-            if data.get("success") and data.get("employees"):
-                # Find the best match (simple exact name match here)
-                for employee in data["employees"]:
-                    # Case-insensitive comparison for robustness
+            # Debug: Print the response structure
+            print(f"   Response structure: {data.keys() if isinstance(data, dict) else 'Not a dict'}")
+
+            # Check response structure
+            if "companyEmployeesData" in data and "companyEmployees" in data["companyEmployeesData"]:
+                employees = data["companyEmployeesData"]["companyEmployees"]
+                if not employees:
+                    print("   Lead411 search successful but returned no employee matches.")
+                    return None
+
+                # Find the best match
+                target_fname_lower = first_name.strip().lower()
+                target_lname_lower = last_name.strip().lower()
+
+                for employee in employees:
                     emp_fname = employee.get("first_name", "").strip().lower()
                     emp_lname = employee.get("last_name", "").strip().lower()
-                    target_fname = first_name.strip().lower()
-                    target_lname = last_name.strip().lower()
 
-                    if emp_fname == target_fname and emp_lname == target_lname:
+                    # Exact match check
+                    if emp_fname == target_fname_lower and emp_lname == target_lname_lower:
                         employee_id = employee.get('employee_id')
                         if employee_id:
-                            print(f"   Found potential match with ID: {employee_id}")
+                            print(f"   Found exact match with ID: {employee_id}")
                             return int(employee_id)
-                        else:
-                            print("   Found matching employee record but missing employee_id.")
-                
+
                 print("   No exact name match found in search results.")
                 return None
+
             else:
-                error_message = data.get('message', 'Search endpoint returned failure or no employees')
-                print(f"   Lead411 search failed or returned no employees: {error_message}")
+                error_message = data.get('message', 'Search endpoint returned failure or unexpected structure')
+                print(f"   Lead411 search failed or returned unexpected data: {error_message}")
+                print(f"   Response data:\n{json.dumps(data, indent=2)}")  # Pretty print the response
                 return None
+
         except requests.exceptions.Timeout:
             print("   Lead411 Search request timed out.")
             return None
         except requests.exceptions.RequestException as e:
-            print(f"   Lead411 Search request error: {e}")
+            error_details = ""
+            try:
+                error_details = f" Status Code: {response.status_code}, Response: {response.text}"
+            except:
+                pass
+            print(f"   Lead411 Search request error: {e}{error_details}")
+            return None
+        except ValueError:
+            print(f"   Lead411 Search response was not valid JSON. Response: {response.text}")
+            return None
+
+    def _get_company_id(self, company_name: Optional[str], company_website: Optional[str], token: str) -> Optional[int]:
+        """
+        Searches for a company to get its ID using Lead411 API.
+        Returns the company ID if found, otherwise None.
+        """
+        search_url = f"{self.BASE_URL}/search/searchUsingJSON"
+        headers = {"Accept": "application/json"}
+
+        # Prepare parameters for the search
+        params = {
+            "token": token,
+            "page": 1,
+            "per_page": 1,  # We only need one result
+            "companyResults": "companyResultsAll",
+            "country_code": "US"  # Focus on US companies
+        }
+
+        # Prioritize company website for searching, fallback to company name
+        search_query = None
+        if company_website:
+            # Extract domain if possible, otherwise use the full string
+            match = re.search(r'^(?:https?:\/\/)?(?:www\.)?([^:\/?#\n]+)', company_website)
+            if match:
+                search_query = match.group(1)
+            else:
+                search_query = company_website
+            params["user_search_string"] = search_query
+        elif company_name:
+            search_query = company_name
+            params["user_search_string"] = search_query
+
+        if not search_query:
+            print("   Skipping company search: Missing company website or name.")
+            return None
+
+        print(f"   Searching Lead411 for company: {search_query}...")
+        try:
+            response = requests.post(search_url, params=params, headers=headers, timeout=20)
+            response.raise_for_status()
+            data = response.json()
+
+            if "AllResults" in data and data["AllResults"]:
+                company = data["AllResults"][0]
+                company_id = company.get("company_id")
+                if company_id:
+                    print(f"   Found company ID: {company_id}")
+                    return int(company_id)
+
+            print("   No company found matching the search criteria.")
+            return None
+
+        except requests.exceptions.Timeout:
+            print("   Lead411 Company Search request timed out.")
+            return None
+        except requests.exceptions.RequestException as e:
+            error_details = ""
+            try:
+                error_details = f" Status Code: {response.status_code}, Response:\n{json.dumps(response.json(), indent=2)}"
+            except:
+                pass
+            print(f"   Lead411 Company Search request error: {e}{error_details}")
+            return None
+        except ValueError:
+            print(f"   Lead411 Company Search response was not valid JSON. Response: {response.text}")
             return None
 
     def _unlock_contact(self, employee_id: int) -> Optional[Dict[str, Any]]:
         """
         Unlocks contact details (email, linkedin) for a given employee ID.
         Returns a dictionary with details or None if unlock fails.
+        Uses the 'Unlock Employee Data Email and Phone' endpoint.
         """
         token = self._get_token()
-        if not token or not employee_id:
+        if not token:
             print("   Skipping unlock: Authentication token not available.")
             return None
+        if not employee_id:
+             print("   Skipping unlock: Invalid employee_id provided.")
+             return None
 
         unlock_url = f"{self.BASE_URL}/employee/unlock_employee_record"
-        headers = {"Content-Type": "application/json", "token": token}
-        payload = {"employee_id": employee_id}
+        headers = {"Accept": "application/json"} # Only Accept header needed
+        params = {
+            "token": token,
+            "employee_id": employee_id
+        }
 
         print(f"   Unlocking Lead411 contact details for ID: {employee_id}...")
         try:
-            response = requests.post(unlock_url, json=payload, headers=headers, timeout=15)
+            # Use POST method as per documentation
+            response = requests.post(unlock_url, params=params, headers=headers, timeout=15)
             response.raise_for_status()
             data = response.json()
 
-            if data.get("success") and data.get("employee"):
-                print("   Unlock successful.")
-                employee_data = data["employee"]
-                unlocked_details = {
-                    "email": employee_data.get("email"),
-                    "linkedin_url": employee_data.get("linkedin_url")
-                }
-                return unlocked_details
+            # --- Debug: Print the full response immediately ---
+            print(f"   Raw Unlock Response Data:\n{json.dumps(data, indent=2)}")
+            # --- End Debug ---
+
+            # Debug: Print the response structure keys
+            print(f"   Unlock response structure (keys): {data.keys() if isinstance(data, dict) else 'Not a dict'}")
+
+            # Check response structure based on the actual observed response
+            if data.get("status") == "success":
+                print("   Unlock status is 'success'. Extracting details...")
+                # Extract email from top level
+                found_email = data.get("email")
+                
+                # Extract LinkedIn URL from nested employee_details
+                employee_details = data.get("employee_details") # Get the nested dictionary
+                found_linkedin = None
+                if isinstance(employee_details, dict):
+                    found_linkedin = employee_details.get("linkedin")
+
+                # Extract Company Website and Address from company_data
+                company_data = data.get("company_data")
+                found_company_website = None
+                found_address1 = None
+                found_address2 = None
+                if isinstance(company_data, dict):
+                    found_company_website = company_data.get("URL")
+                    found_address1 = company_data.get("address1")
+                    found_address2 = company_data.get("address2")
+                    # Potentially add city, state, zip if needed later
+                    # found_city = company_data.get("city")
+                    # found_state = company_data.get("region_code")
+                    # found_zip = company_data.get("zip")
+                
+                # Prepare the result dictionary
+                unlocked_details = {}
+                if found_email:
+                    unlocked_details["email"] = found_email
+                if found_linkedin:
+                    unlocked_details["linkedin_url"] = found_linkedin # Use the key expected by enrich_leads
+                if found_company_website:
+                    unlocked_details["company_website"] = found_company_website
+                # Combine address fields
+                address_parts = [addr for addr in [found_address1, found_address2] if pd.notna(addr) and addr.strip()]
+                if address_parts:
+                    unlocked_details["address"] = ", ".join(address_parts)
+                
+                if unlocked_details:
+                    print(f"   Found details: {json.dumps(unlocked_details, indent=2)}")
+                    return unlocked_details
+                else:
+                    print("   Unlock successful, but no email, linkedin, website or address found in the response structure.")
+                    # Already printed the full response above
+                    return None
             else:
-                error_message = data.get('message', 'Unlock endpoint returned failure')
+                error_message = data.get('message', 'Unlock endpoint returned failure status or unexpected structure')
                 print(f"   Lead411 Unlock failed: {error_message}")
+                # Already printed the full response above
                 return None
+
         except requests.exceptions.Timeout:
             print("   Lead411 Unlock request timed out.")
             return None
         except requests.exceptions.RequestException as e:
-            print(f"   Lead411 Unlock request error: {e}")
+            error_details = ""
+            try:
+                error_details = f" Status Code: {response.status_code}, Response:\n{json.dumps(response.json(), indent=2)}"
+            except:
+                pass
+            print(f"   Lead411 Unlock request error: {e}{error_details}")
             return None
+        except ValueError: # Catches JSONDecodeError
+             print(f"   Lead411 Unlock response was not valid JSON. Response: {response.text}")
+             return None
 
-    def find_contact_details(self, first_name: str, last_name: str, 
-                           company_name: Optional[str], company_website: Optional[str]) -> Optional[Dict[str, Any]]:
+    def find_contact_details(self, first_name: str, last_name: str, title: Optional[str],
+                           company_name: Optional[str], company_website: Optional[str],
+                           state: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
-        Orchestrates search and unlock to find contact details.
+        Orchestrates search and unlock using Lead411 to find contact details.
         Returns a dictionary {'email': ..., 'linkedin_url': ...} or None.
         """
-        employee_id = self._search_contact(first_name, last_name, company_name, company_website)
+        employee_id = self._search_contact(first_name, last_name, title, company_name, company_website, state)
         if employee_id:
             # Short delay before unlocking might be polite to the API
-            time.sleep(0.5) 
+            time.sleep(0.5)
             return self._unlock_contact(employee_id)
-        return None
-
-
+        else:
+            print(f"   Could not find a suitable employee ID for {first_name} {last_name} via Lead411 search.")
+            return None
 
 
 class PersonDetailsScraperPandas:
-    """Reads an Excel file, orchestrates lead enrichment, and saves changes."""
+    """Reads an Excel file, orchestrates lead enrichment using Lead411, and saves changes."""
 
     def __init__(self, filename: str = XLSX_FILE):
         self.filepath: Path = Path.cwd() / filename
@@ -236,375 +366,235 @@ class PersonDetailsScraperPandas:
 
         if not self.filepath.exists():
             raise FileNotFoundError(f"Input Excel file not found at {self.filepath}")
-        
+
         self._load_data()
 
     def _load_data(self) -> None:
         """Loads data from the Excel file into a pandas DataFrame."""
         try:
-            # header=0 means the FIRST row (index 0) is the header
-            self.df = pd.read_excel(self.filepath, header=0) 
-            # Print the actual column names found by pandas
+            # Define desired data types for specific columns
+            dtypes = {
+                'Email': str,
+                'Linkedin Profile Link': str
+                # Add other columns if they also need specific types
+            }
+            # Load Excel, specifying dtypes. Use 'object' if 'str' causes issues.
+            self.df = pd.read_excel(self.filepath, header=0, dtype=dtypes)
             print(f"DataFrame columns found: {self.df.columns.tolist()}")
-            
-            # Check if essential columns exist before proceeding
+
+            # # --- Ensure correct dtypes for string columns (Now handled by dtype in read_excel) ---
+            # if 'Email' in self.df.columns:
+            #     self.df['Email'] = self.df['Email'].astype(object)
+            # if 'Linkedin Profile Link' in self.df.columns:
+            #     self.df['Linkedin Profile Link'] = self.df['Linkedin Profile Link'].astype(object)
+            # # --- End dtype correction ---
+
             required_columns = ['Contact Name', 'Company Name', 'Company Website', 'Email', 'Linkedin Profile Link']
             missing_cols = [col for col in required_columns if col not in self.df.columns]
             if missing_cols:
                 print(f"Warning: The following required columns were not found in the Excel file: {missing_cols}")
                 print("Please ensure the first row of your Excel file contains the correct headers.")
-                # Decide if you want to raise an error or try to continue
-                # raise ValueError(f"Missing required columns: {missing_cols}")
-            
+                # Consider raising ValueError if columns are absolutely essential
+
             self.rows_as_dicts = self.df.to_dict(orient='records')
             print(f"Successfully loaded {len(self.rows_as_dicts)} rows into DataFrame.")
-            
-            # Optional: Print first few rows for verification
-            # print("Sample rows (first 5):")
-            # for row in self.rows_as_dicts[:5]:
-            #     print(row)
         except Exception as e:
-            # Provide more context in the error message
             raise IOError(f"Failed to read or process Excel file {self.filepath}: {e}")
 
     def get_rows(self) -> List[Dict]:
         """Returns the loaded data as a list of dictionaries."""
         return self.rows_as_dicts
 
-    # Update enrich_leads signature and logic
-    def enrich_leads(self,
-                   lead411_enricher: Optional[Lead411Enricher] = None,
-                   hunter_api_key: Optional[str] = None,
-                   serpapi_api_key: Optional[str] = None) -> None: # Added serpapi_api_key
+    def enrich_leads(self, lead411_enricher: Lead411Enricher) -> None:
         """
-        Enriches lead data using various APIs based on what's provided.
+        Enriches lead data using the provided Lead411Enricher instance.
 
         Args:
-            lead411_enricher: Optional Lead411Enricher instance for using Lead411 API
-            hunter_api_key: Optional Hunter.io API key for using Hunter.io API
-            serpapi_api_key: Optional SerpAPI API key for Google Search
+            lead411_enricher: Lead411Enricher instance for using Lead411 API
         """
         if self.df is None:
             print("Error: DataFrame not loaded. Cannot enrich leads.")
             return
 
-        if not lead411_enricher and not hunter_api_key and not serpapi_api_key: # Added serpapi_api_key check
-            print("Error: No enrichment service provided. Need Lead411, Hunter API key, or SerpAPI key.")
+        if not lead411_enricher:
+            print("Error: Lead411Enricher instance not provided. Cannot enrich leads.")
             return
 
-        print("\\nStarting enrichment process...")
-        if lead411_enricher:
-            print("- Using Lead411 API")
-        if hunter_api_key:
-            print("- Using Hunter.io API")
-        if serpapi_api_key: # Added SerpAPI check
-            print("- Using SerpAPI for LinkedIn search")
+        print("\nStarting enrichment process using Lead411 API...")
 
-        # Tracking enrichment statistics
         updates_made = 0
         email_updates = 0
         linkedin_updates = 0
+        website_updates = 0 # New counter
+        address_updates = 0 # New counter
         enriched_rows = []
 
         for idx, row_data in self.df.iterrows():
-            # Use .get with default to handle potentially missing columns gracefully
+            # Check which fields are missing
             email_missing = pd.isna(row_data.get('Email'))
             linkedin_missing = pd.isna(row_data.get('Linkedin Profile Link'))
+            website_missing = pd.isna(row_data.get('Company Website'))
+            address_missing = pd.isna(row_data.get('Address')) # Assuming 'Address' column exists
+            suite_missing = pd.isna(row_data.get('Suite')) # Check for Suite separately if needed
 
-            if not (email_missing or linkedin_missing):
-                continue  # Skip if nothing is missing
+            # Skip if all target fields are already filled
+            if not (email_missing or linkedin_missing or website_missing or address_missing or suite_missing):
+                continue
 
             contact_name = row_data.get('Contact Name')
             company_name = row_data.get('Company Name')
-            company_website = row_data.get('Company Website')
+            company_website = row_data.get('Company Website') # Get current value if exists
 
-            # Basic validation
             if pd.isna(contact_name) or (pd.isna(company_name) and pd.isna(company_website)):
-                print(f"\\nSkipping row index {idx}: Missing Contact Name or both Company Name/Website.")
+                print(f"\nSkipping row index {idx}: Missing Contact Name or both Company Name/Website.")
                 continue
 
-            # Split name for API calls
-            name_parts = str(contact_name).split()  # Ensure it's a string
+            name_parts = str(contact_name).split()
             first_name = name_parts[0] if name_parts else None
             last_name = ' '.join(name_parts[1:]) if len(name_parts) > 1 else None
 
             if not first_name or not last_name:
-                print(f"\\nSkipping row index {idx}: Could not extract First/Last name from '{contact_name}'.")
+                print(f"\nSkipping row index {idx}: Could not extract First/Last name from '{contact_name}'.")
                 continue
 
-            print(f"\\nEnriching row index {idx}: {contact_name} at {company_name or company_website}")
+            print(f"\nEnriching row index {idx}: {contact_name} at {company_name or company_website}")
 
             found_email = None
             found_linkedin = None
+            found_company_website = None # Initialize found values
+            found_address = None         # Initialize found values
+            title = str(row_data.get('Title')) if pd.notna(row_data.get('Title')) else None # Get title
 
-            # --- Try Hunter.io first if API key is provided ---
-            if email_missing and hunter_api_key:
-                print(f"   Trying Hunter.io API for email...")
-                domain = None
-                if pd.notna(company_website):
-                    # Improved regex to handle various URL formats
-                    match = re.search(r'^(?:https?:\/\/)?(?:[^@\n]+@)?(?:www\.)?([^:\/?#\n]+)', str(company_website))
-                    if match:
-                        domain = match.group(1)
-                if first_name and last_name and (domain or company_name):
-                    try:
-                        params = {'api_key': hunter_api_key, 'first_name': first_name, 'last_name': last_name}
-                        if domain: params['domain'] = domain
-                        elif company_name: params['company'] = str(company_name) # Ensure company name is string
-                        print(f"   Querying Hunter.io Email Finder...")
-                        response = requests.get("https://api.hunter.io/v2/email-finder", params=params, timeout=15)
-                        response.raise_for_status()
-                        data = response.json()
-                        if data.get('data') and data['data'].get('email'):
-                            found_email = data['data']['email']
-                            score = data['data'].get('score', 0)
-                            print(f"   Found email via Hunter.io with confidence score: {score}/100")
-                        else:
-                            print(f"   Hunter.io found no email for {contact_name}.")
-                            if data.get('errors'): print(f"   Hunter.io API Errors: {data['errors']}")
-                    except requests.exceptions.RequestException as e: print(f"   Hunter.io API Request Error: {e}")
-                    except Exception as e: print(f"   Error during Hunter.io enrichment: {e}")
-                else: print("   Skipping Hunter.io: Insufficient data (need domain or company name).")
+            # --- Try Lead411 ---
+            print(f"   Trying Lead411 API...")
+            try:
+                details = lead411_enricher.find_contact_details(
+                    first_name, last_name, title,
+                    str(company_name) if pd.notna(company_name) else None,
+                    str(company_website) if pd.notna(company_website) else None,
+                    str(row_data.get('State')) if pd.notna(row_data.get('State')) else None
+                )
+                
+                if details:
+                    if email_missing and details.get("email"):
+                        found_email = details.get("email")
+                        print(f"   Found Email via Lead411: {found_email}")
+                        
+                    if linkedin_missing and details.get("linkedin_url"):
+                        found_linkedin = details.get("linkedin_url")
+                        print(f"   Found LinkedIn via Lead411: {found_linkedin}")
+                        
+                    if website_missing and details.get("company_website"):
+                        found_company_website = details.get("company_website")
+                        print(f"   Found Company Website via Lead411: {found_company_website}")
+                        
+                    # Use found address for either 'Address' or 'Suite' if missing
+                    if (address_missing or suite_missing) and details.get("address"):
+                        found_address = details.get("address")
+                        print(f"   Found Address via Lead411: {found_address}")
 
+                    # Log if contact found but missing data wasn't retrieved
+                    # (Refined logging check)
+                    needed_but_not_found = []
+                    if email_missing and not found_email: needed_but_not_found.append('Email')
+                    if linkedin_missing and not found_linkedin: needed_but_not_found.append('LinkedIn')
+                    if website_missing and not found_company_website: needed_but_not_found.append('Website')
+                    if (address_missing or suite_missing) and not found_address: needed_but_not_found.append('Address/Suite')
+                    
+                    if needed_but_not_found and any([found_email, found_linkedin, found_company_website, found_address]):
+                        print(f"   Lead411 found contact but did not return missing: {', '.join(needed_but_not_found)}.")
 
-            # --- Try Lead411 if needed ---
-            # Check if email is still missing OR if linkedin is missing
-            needs_lead411 = (email_missing and not found_email) or linkedin_missing
-            if lead411_enricher and needs_lead411:
-                print(f"   Trying Lead411 API...")
-                try:
-                    details = lead411_enricher.find_contact_details(
-                        first_name, last_name,
-                        str(company_name) if pd.notna(company_name) else None, # Ensure string
-                        str(company_website) if pd.notna(company_website) else None # Ensure string
-                    )
-                    if details:
-                        # Only update email if it's still missing
-                        if email_missing and not found_email and details.get("email"):
-                            found_email = details.get("email")
-                            print("   Found Email via Lead411.")
-                        # Update LinkedIn if it's missing AND Lead411 provided it
-                        if linkedin_missing:
-                            found_linkedin = details.get("linkedin_url")
-                            if found_linkedin:
-                                print(f"   Lead411 found LinkedIn: {found_linkedin}")
-                            else:
-                                print("   Lead411 did not provide a LinkedIn URL.")
-                        # Simplified message
-                        print(f"   Lead411 results processed.")
-                    else:
-                        print(f"   Lead411 could not find details for {contact_name}.")
-                except Exception as e:
-                    print(f"   Error during Lead411 enrichment: {e}")
+            except Exception as e:
+                print(f"   Error during Lead411 enrichment orchestration: {e}")
+                import traceback
+                traceback.print_exc()
 
-
-            # --- Try SerpAPI for LinkedIn if still missing ---
-            # Check if LinkedIn is missing AND we haven't found it yet AND the API key is provided
-            if linkedin_missing and not found_linkedin and serpapi_api_key:
-                print(f"   Trying SerpAPI for LinkedIn...") # Removed key check message from here
-                # No need for an inner 'else' block if the outer 'if' handles the key check
-
-                try:
-                    company_identifier = str(company_name or company_website or '')
-                    if company_identifier:
-                        search_query = f'"{first_name} {last_name}" "{company_identifier}" site:linkedin.com/in'
-                        params = {
-                            "engine": "google",
-                            "q": search_query,
-                            "api_key": serpapi_api_key,
-                            "num": 10,
-                            "start": 0
-                        }
-                        print(f"   Querying SerpAPI with: '{search_query}'")
-                        search = GoogleSearch(params)
-                        results = search.get_dict() # Execute the search and get results
-
-                        # Check if 'organic_results' key exists and is not empty
-                        organic_results = results.get("organic_results")
-                        if not organic_results:
-                            print("   SerpAPI returned no organic results.")
-                            # Optional: Log the full response if needed for debugging
-                            # print(f"   SerpAPI Full Response (for debugging): {results}")
-                        else:
-                            print(f"   SerpAPI Raw Results Count: {len(organic_results)}")
-
-                            best_match_url = None
-                            highest_score = -1
-
-                            target_name_lower = f"{first_name} {last_name}".lower()
-                            target_company_lower = company_identifier.lower()
-
-                            for i, result in enumerate(organic_results): # Iterate directly over the list
-                                link = result.get("link", "")
-                                title = result.get("title", "").lower()
-                                snippet = result.get("snippet", "").lower()
-                                print(f"      [{i+1}] Checking: Title='{result.get('title', '')}' Link='{link}'")
-
-                                # ... existing URL filtering ...
-                                if "linkedin.com/in/" not in link or any(x in link for x in ["/company/", "/pub/", "/jobs/", "/sales/people/", "/posts/"]):
-                                    print(f"         Skipping link: Not a valid profile URL or excluded path.")
-                                    continue
-
-                                # --- Fuzzy Matching ---
-                                name_score_title = fuzz.partial_ratio(target_name_lower, title)
-                                name_score_snippet = fuzz.partial_ratio(target_name_lower, snippet)
-                                name_score = max(name_score_title, name_score_snippet)
-
-                                # Calculate company_score using token_set_ratio on company name
-                                company_score = max(
-                                    fuzz.token_set_ratio(target_company_lower, title),
-                                    fuzz.token_set_ratio(target_company_lower, snippet)
-                                )
-
-                                # Extract domain identifier (if available) and calculate domain_score
-                                domain_identifier = ''
-                                if pd.notna(company_website):
-                                    dm = re.search(r'^(?:https?://)?(?:www\.)?([^:/?#\n]+)', company_website)
-                                    if dm:
-                                        domain_identifier = dm.group(1).lower()
-                                domain_score = 0
-                                if domain_identifier:
-                                    domain_score = max(
-                                        fuzz.partial_ratio(domain_identifier, link.lower()),
-                                        fuzz.partial_ratio(domain_identifier, title),
-                                        fuzz.partial_ratio(domain_identifier, snippet)
-                                    )
-
-                                # Combined confidence score with domain weight
-                                combined_score = (name_score * 0.5) + (company_score * 0.3) + (domain_score * 0.2)
-                                print(f"         Scores: Name={name_score}, Company={company_score}, Domain={domain_score}, Combined={combined_score:.2f}")
-
-                                # Selection thresholds include domain check
-                                # Define high-name and lower-company thresholds
-                                # Dynamic selection logic
-                                if (name_score >= HIGH_NAME_SCORE and combined_score >= MIN_COMBINED_SCORE):
-                                    # High confidence on name alone
-                                    highest_score = combined_score
-                                    best_match_url = link
-                                    print(f"         >>> High-name fallback selected! Score: {combined_score:.2f}, URL: {link}")
-                                elif (name_score >= MIN_NAME_SCORE and company_score >= MIN_COMPANY_SCORE and
-                                      (not domain_identifier or domain_score >= MIN_DOMAIN_SCORE) and
-                                      combined_score >= MIN_COMBINED_SCORE):
-                                    if (combined_score > highest_score):
-                                        highest_score = combined_score
-                                        best_match_url = link
-                                        print(f"         >>> New best match found! Score: {highest_score:.2f}, URL: {link}")
-                                elif (domain_identifier and domain_score >= 80 and
-                                      name_score >= MIN_NAME_SCORE and combined_score >= MIN_COMBINED_SCORE):
-                                    # Domain-heavy fallback
-                                    highest_score = combined_score
-                                    best_match_url = link
-                                    print(f"         >>> Domain-fallback selected! Score: {combined_score:.2f}, URL: {link}")
-                                else:
-                                    print(f"         Skipping link: did not meet dynamic thresholds (Name: {name_score}, Company: {company_score}, Domain: {domain_score}, Combined: {combined_score:.2f}).")
-
-
-                            # After checking all results, we may want to verify borderline matches with Gemini
-                            if best_match_url and GEMINI_THRESHOLD_LOW <= highest_score <= GEMINI_THRESHOLD_HIGH:
-                                # This is a borderline match - use Gemini to verify
-                                print(f"   Borderline confidence score ({highest_score:.2f}): Using Gemini for verification...")
-                                
-                                # Extract the best match's title/snippet for context
-                                best_match_result = next((r for r in organic_results if r.get("link") == best_match_url), None)
-                                if best_match_result:
-                                    best_title = best_match_result.get("title", "")
-                                    best_snippet = best_match_result.get("snippet", "")
-                                    linkedin_context = f"{best_title} - {best_snippet}"
-                                    
-                                    # Use Gemini to verify this match
-                                    is_verified = verify_with_gemini(
-                                        f"{first_name} {last_name}",
-                                        company_identifier,
-                                        linkedin_context,
-                                        highest_score
-                                    )
-                                    
-                                    if is_verified:
-                                        print(f"   >>> Gemini verified the LinkedIn match: {best_match_url}")
-                                    else:
-                                        print(f"   >>> Gemini rejected the match. Discarding LinkedIn URL.")
-                                        best_match_url = None  # Discard the match if Gemini says no
-                            
-                            # Update found_linkedin based on final decision
-                            if best_match_url:
-                                found_linkedin = best_match_url
-                                print(f"   >>> Final selected LinkedIn URL: {found_linkedin} (Score: {highest_score:.2f})")
-                            else:
-                                print("   No suitable LinkedIn URL found that meets confidence thresholds.")
-
-                    else: # if not company_identifier
-                        print("   Skipping SerpAPI: Missing company name/website for query.")
-
-                except requests.exceptions.RequestException as req_err:
-                    # Catch potential network errors from the underlying request
-                    print(f"   Error during SerpAPI request: {req_err}")
-                except Exception as e:
-                    # Catch other potential errors during SerpAPI interaction or result processing
-                    print(f"   An unexpected error occurred during SerpAPI processing: {e}")
-                    import traceback
-                    traceback.print_exc() # Keep traceback for unexpected errors
-
-            # --- Update DataFrame ---
+            # --- Update DataFrame ---            
             row_updated = False
-            email_updated = False
-            linkedin_updated = False
+            email_updated_this_row = False
+            linkedin_updated_this_row = False
+            website_updated_this_row = False # New flag
+            address_updated_this_row = False # New flag
 
-            # Update Email if it was missing and we found one
             if email_missing and pd.notna(found_email):
-                self.df.loc[idx, 'Email'] = found_email
-                print(f"   Updated Email: {found_email}")
+                self.df.at[idx, 'Email'] = found_email
                 row_updated = True
-                email_updated = True
+                email_updated_this_row = True
                 email_updates += 1
 
-            # Update LinkedIn if it was missing and we found one (from Lead411 or SerpAPI)
             if linkedin_missing and pd.notna(found_linkedin):
-                self.df.loc[idx, 'Linkedin Profile Link'] = found_linkedin
-                print(f"   Updated LinkedIn: {found_linkedin}")
+                self.df.at[idx, 'Linkedin Profile Link'] = found_linkedin
                 row_updated = True
-                linkedin_updated = True
+                linkedin_updated_this_row = True
                 linkedin_updates += 1
+                
+            if website_missing and pd.notna(found_company_website):
+                self.df.at[idx, 'Company Website'] = found_company_website
+                row_updated = True
+                website_updated_this_row = True
+                website_updates += 1
+                
+            # Update 'Address' or 'Suite' based on what's missing and found
+            if address_missing and pd.notna(found_address):
+                 self.df.at[idx, 'Address'] = found_address
+                 row_updated = True
+                 address_updated_this_row = True
+            elif suite_missing and pd.notna(found_address):
+                # If Address exists but Suite is missing, put found address in Suite
+                # This assumes 'Suite' column exists and is the target if 'Address' is already filled
+                if 'Suite' in self.df.columns:
+                    self.df.at[idx, 'Suite'] = found_address
+                    row_updated = True
+                    address_updated_this_row = True # Count as an address update
+                else:
+                    print("   Warning: 'Suite' column not found, cannot update.")
+            
+            # Increment address counter only once per row if an update happened
+            if address_updated_this_row:
+                address_updates += 1
 
             if row_updated:
                 updates_made += 1
-                # Track which row was updated and what was updated
                 enriched_rows.append({
                     'index': idx,
                     'contact_name': contact_name,
                     'company': company_name or company_website,
-                    'email_updated': email_updated,
-                    'found_email': found_email if email_updated else None,
-                    'linkedin_updated': linkedin_updated,
-                    'found_linkedin': found_linkedin if linkedin_updated else None
+                    'email_updated': email_updated_this_row,
+                    'found_email': found_email if email_updated_this_row else None,
+                    'linkedin_updated': linkedin_updated_this_row,
+                    'found_linkedin': found_linkedin if linkedin_updated_this_row else None,
+                    'website_updated': website_updated_this_row,
+                    'found_website': found_company_website if website_updated_this_row else None,
+                    'address_updated': address_updated_this_row,
+                    'found_address': found_address if address_updated_this_row else None
                 })
-            # Only print failure message if we actually tried to find something and failed
-            elif (email_missing or linkedin_missing):
-                tried_email = email_missing and (hunter_api_key or lead411_enricher)
-                tried_linkedin = linkedin_missing and (lead411_enricher or serpapi_api_key)
-                if tried_email or tried_linkedin:
-                    print(f"   Could not find missing data for {contact_name} using available services.")
+            elif (email_missing or linkedin_missing or website_missing or address_missing or suite_missing):
+                 print(f"   Could not find missing data for {contact_name} using Lead411.")
 
-            # Add a delay to avoid rate limiting (consider if SerpAPI needs its own delay)
-            time.sleep(1) # Keep the general delay
+            time.sleep(1) # API delay
 
         # Print summary of updates
-        print(f"\\nEnrichment complete. Updated {updates_made} rows total:")
+        print(f"\nEnrichment complete. Updated {updates_made} rows total using Lead411:")
         print(f"- Email addresses filled: {email_updates}")
         print(f"- LinkedIn URLs filled: {linkedin_updates}")
+        print(f"- Company Websites filled: {website_updates}") # New summary line
+        print(f"- Addresses/Suites filled: {address_updates}") # New summary line
 
         if enriched_rows:
-            print("\\nDetails of enriched rows:")
+            print("\nDetails of enriched rows:")
             for row in enriched_rows:
                 details = []
-                if row['email_updated']:
-                    details.append(f"Email: {row['found_email']}")
-                if row['linkedin_updated']:
-                    details.append(f"LinkedIn: {row['found_linkedin']}")
-                if details: # Only print if something was updated
+                if row['email_updated']: details.append(f"Email: {row['found_email']}")
+                if row['linkedin_updated']: details.append(f"LinkedIn: {row['found_linkedin']}")
+                if row['website_updated']: details.append(f"Website: {row['found_website']}")
+                if row['address_updated']: details.append(f"Address/Suite: {row['found_address']}")
+                if details:
                     print(f"Row {row['index']} - {row['contact_name']} at {row['company']}: {', '.join(details)}")
 
         if updates_made > 0:
             self.save_changes()
+        else:
+            print("\nNo changes were made to the file.")
 
     def save_changes(self, output_path: Optional[str] = None) -> None:
         """Saves the current state of the DataFrame back to an Excel file."""
@@ -613,57 +603,13 @@ class PersonDetailsScraperPandas:
             return
 
         save_path = Path(output_path) if output_path else self.filepath
-        print(f"\\nSaving updated DataFrame to '{save_path}'...")
+        print(f"\nSaving updated DataFrame to '{save_path}'...")
         try:
-            # Ensure the directory exists if saving to a new path
             save_path.parent.mkdir(parents=True, exist_ok=True)
             self.df.to_excel(save_path, index=False)
             print(f"DataFrame successfully saved.")
         except Exception as e:
             print(f"Error saving DataFrame to {save_path}: {e}")
-
-def verify_with_gemini(person_name, company_name, linkedin_profile_title, confidence_score):
-    """
-    Uses Gemini Flash to verify if a LinkedIn profile likely belongs to the target person at the target company.
-    
-    Args:
-        person_name: The name of the person we're searching for
-        company_name: The name of the company the person works at
-        linkedin_profile_title: The title or snippet from the LinkedIn profile
-        confidence_score: The fuzzy matching confidence score (0-100)
-        
-    Returns:
-        Boolean: True if verified as likely match, False otherwise
-    """
-    if not gemini_model:
-        print("   Gemini verification skipped: model not available")
-        return False  # Skip if Gemini is not configured
-    
-    prompt = f"""
-    Analyze whether this LinkedIn profile likely belongs to the target person:
-    
-    Target Person: "{person_name}"
-    Target Company: "{company_name}"
-    LinkedIn Profile Info: "{linkedin_profile_title}"
-    Fuzzy Match Score: {confidence_score}/100
-    
-    Based on the information, does this LinkedIn profile likely belong to the target person at the target company?
-    Consider name variations, company name variations (abbreviations, omitted legal suffixes like Inc, Ltd, LLC),
-    and job titles/roles. 
-    
-    Answer with only "Yes" or "No".
-    """
-    
-    try:
-        response = gemini_model.generate_content(prompt)
-        # Parse the response (expecting a simple "Yes" or "No")
-        answer = response.text.strip().lower()
-        is_verified = "yes" in answer.lower()
-        print(f"   Gemini verification for '{person_name}' at '{company_name}': {answer} -> {'Verified ✓' if is_verified else 'Not Verified ✗'}")
-        return is_verified
-    except Exception as e:
-        print(f"   Error during Gemini verification: {e}")
-        return False  # Treat errors as non-verification
 
 
 if __name__ == "__main__":
@@ -672,43 +618,33 @@ if __name__ == "__main__":
         # Initialize the scraper (loads data)
         scraper = PersonDetailsScraperPandas(filename=XLSX_FILE)
 
-        # Get API credentials from environment
+        # Get Lead411 API credentials from environment
         lead411_email = os.getenv("LEAD411_EMAIL")
         lead411_password = os.getenv("LEAD411_PASSWORD")
-        hunter_key = os.getenv("HUNTER_API_KEY")
-        serpapi_key = os.getenv("SERPAPI_API_KEY") # Standardize env variable name
+        # Removed Hunter and SerpAPI key loading
 
-        # Initialize services based on available credentials
+        # Initialize Lead411 enricher
         lead411_enricher = None
         if lead411_email and lead411_password:
             print("Lead411 credentials found.")
-            lead411_enricher = Lead411Enricher(lead411_email, lead411_password)
+            try:
+                lead411_enricher = Lead411Enricher(lead411_email, lead411_password)
+                # Check if authentication was successful
+                if lead411_enricher._get_token() is None:
+                    print("Error: Lead411 authentication failed. Please check credentials.")
+                    sys.exit(1)
+            except ConnectionError as e: # Catch auth errors if raised
+                 print(f"Error initializing Lead411: {e}")
+                 sys.exit(1)
         else:
-            print("Lead411 credentials not found. Skipping Lead411 API.")
-
-        if not hunter_key:
-            print("Hunter.io API key not found. Skipping Hunter.io API.")
-        else:
-            print("Hunter.io API key found.")
-
-        if not serpapi_key: # Check the correct variable
-            print("SerpAPI API key (SERPAPI_API_KEY) not found in .env. Skipping SerpAPI LinkedIn search.")
-        else:
-            print("SerpAPI API key found.")
-
-        if not lead411_enricher and not hunter_key and not serpapi_key: # Check correct variable
-            print("Error: No API credentials found. Please set at least one of:")
-            print("- LEAD411_EMAIL and LEAD411_PASSWORD for Lead411 API")
-            print("- HUNTER_API_KEY for Hunter.io API")
-            print("- SERPAPI_API_KEY for SerpAPI") # Use standardized env var name in message
+            print("Error: Lead411 credentials (LEAD411_EMAIL, LEAD411_PASSWORD) not found in .env file.")
+            print("Cannot proceed without Lead411 credentials.")
             sys.exit(1)
 
-        # Run the enrichment process with available services
-        scraper.enrich_leads(
-            lead411_enricher=lead411_enricher,
-            hunter_api_key=hunter_key,
-            serpapi_api_key=serpapi_key # Pass the correct variable name
-        )
+        # Removed checks for Hunter/SerpAPI keys
+
+        # Run the enrichment process ONLY with Lead411
+        scraper.enrich_leads(lead411_enricher=lead411_enricher)
 
     except FileNotFoundError as e:
         print(f"Error: {e}")
@@ -718,7 +654,6 @@ if __name__ == "__main__":
         sys.exit(1)
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
-        # Print traceback for detailed debugging
         import traceback
         traceback.print_exc()
         sys.exit(1)
