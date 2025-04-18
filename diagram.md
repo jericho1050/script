@@ -8,22 +8,23 @@ flowchart TD
     D --> F
     F --> G[Load API credentials from environment]
     G --> H{Any API credentials found?}
-    H -- None --> I[Exit: No API **credentials**]
-    H -- Found --> J[Initialize APIs: Hunter.io, SerpAPI]
+    H -- None --> I[Exit: No API credentials]
+    H -- Found --> J[Initialize APIs: Lead411, Hunter.io, SerpAPI]
     J --> K[Run enrich_leads]
     K --> L{For each row in Excel}
     L -- Missing data --> M[Try Hunter.io for email]
-    M --> N[Try SerpAPI for LinkedIn]
-    N --> O[Update DataFrame if found]
-    O --> P[Delay to avoid rate limiting]
-    P --> L
-    L -- All rows processed --> Q[Save updated Excel file]
-    Q --> R[Print summary]
-    R --> S[End Script]
+    M --> N[Try Lead411 for email/LinkedIn]
+    N --> O[Try SerpAPI for LinkedIn]
+    O --> P[Update DataFrame if found]
+    P --> Q[Delay to avoid rate limiting]
+    Q --> L
+    L -- All rows processed --> R[Save updated Excel file]
+    R --> S[Print summary]
+    S --> T[End Script]
 
     click A call linkCallback("/Users/jerichowenzel/Desktop/python_assessment_va/main.py#L1")
     click B call linkCallback("/Users/jerichowenzel/Desktop/python_assessment_va/main.py#L40")
-    click C call linkCallback("/Users/**jerichowenzel**/Desktop/python_assessment_va/main.py#L41")
+    click C call linkCallback("/Users/jerichowenzel/Desktop/python_assessment_va/main.py#L41")
     click D call linkCallback("/Users/jerichowenzel/Desktop/python_assessment_va/main.py#L43")
     click E call linkCallback("/Users/jerichowenzel/Desktop/python_assessment_va/main.py#L45")
     click F call linkCallback("/Users/jerichowenzel/Desktop/python_assessment_va/main.py#L533")
