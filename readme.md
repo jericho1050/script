@@ -1,4 +1,4 @@
-```markdown
+
 # Lead Enrichment Automation
 
 A Python utility to automate enrichment of lead data (email, LinkedIn, website, address) in an Excel spreadsheet using the Lead411 API.
